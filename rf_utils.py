@@ -16,6 +16,30 @@ import multiprocessing
 from utils import ece, generate_gaussian_parity
 import argparse
 
+
+def generate_gaussian_parity(n, cov_scale=1, angle_params=None, k=1, acorn=None):
+#     means = [[-1.5, -1.5], [1.5, 1.5], [1.5, -1.5], [-1.5, 1.5]]
+    means = [[-1, -1], [1, 1], [1, -1], [-1, 1]]
+    blob = np.concatenate(
+        [
+            np.random.multivariate_normal(
+                mean, cov_scale * np.eye(len(mean)), size=int(n / 4)
+            )
+            for mean in means
+        ]
+    )
+
+    X = np.zeros_like(blob)
+    Y = np.concatenate([np.ones((int(n / 4))) * int(i < 2) for i in range(len(means))])
+    X[:, 0] = blob[:, 0] * np.cos(angle_params * np.pi / 180) + blob[:, 1] * np.sin(
+        angle_params * np.pi / 180
+    )
+    X[:, 1] = -blob[:, 0] * np.sin(angle_params * np.pi / 180) + blob[:, 1] * np.cos(
+        angle_params * np.pi / 180
+    )
+    return X, Y.astype(int)
+
+
 def get_tree(method='rf', max_depth=1, n_estimators=1, max_leaf_nodes = None ):
     if method == 'gb':
         rf = GradientBoostingClassifier(max_depth=max_depth, n_estimators=n_estimators, random_state=1514, max_leaf_nodes=max_leaf_nodes, learning_rate=1, criterion='mse')
