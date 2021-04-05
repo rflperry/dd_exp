@@ -256,3 +256,20 @@ def extract_losses(rep_full_list):
     train_err_list = np.array([ee[3] for ee in rep_full_list])
 
     return [full_loss_list, test_loss_list, train_loss_list, test_err_list, train_err_list]
+
+# Average stability
+def compute_avg_stability(model, hybrid_set):
+    # (train_x, train_y, test_x, test_y, hybrid_sets) = get_dataset(include_hybrid=True)
+    stab_dif = 0
+    N = len(hybrid_set)
+    loss_func = torch.nn.BCEWithLogitsLoss()
+
+    for i in range(N):
+        model_hybrid = copy.deepcopy(model)
+
+        ghost_loss = loss_func(model(hybrid_set[i][0]), hybrid_set[i][1])
+        loss = train_model(model_hybrid, hybrid_set[i][0], hybrid_set[i][1])
+        stab_dif += ( ghost_loss.detach().cpu().numpy().item() - loss[-1] )
+
+    return stab_dif / N
+    
