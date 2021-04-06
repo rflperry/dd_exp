@@ -10,6 +10,8 @@ import copy
 import random
 import concurrent.futures
 
+import seaborn as sns
+
 ## Distributions 
 
 def generate_gaussian_parity(n, cov_scale=1, angle_params=None, k=1, acorn=None):
@@ -186,13 +188,25 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
         del train_y_tmp
         losses_list = []
         num_pars = []
+        num_poly = []
+        hellinger_list = []
+        gini_train, gini_test = [], []
+
         
         train_loss_list = []
         test_loss_list = []
         train_acc_list = []
         test_acc_list = []
-        
-        for i in range(1, iterations):#20
+
+        penultimate_acts = []
+        penultimate_nodes = []
+        penultimate_err = []
+        penultimate_poly = []
+        penultimate_vars = []
+
+        avg_stab_list = []
+
+        for i in range(1, iterations):
             print('now running', i)
 
             ## Increasing Depth
@@ -209,15 +223,30 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
 
             losses = train_model(model, train_x, train_y)
 
+            poly, penultimate_act = get_polytopes(model, train_x, penultimate=False)
+            n_poly = len(np.unique(poly[0]))
 
             if depth:
                 n_nodes = i*20 if i>5 else i*i
             else:
                 n_nodes = i*3
             
+            penultimate_acts.append(penultimate_act)
+            penultimate_vars.append(list(np.var(penultimate_act, axis=0)))
+
             with torch.no_grad():
                 pred_train, pred_test = model(train_x), model(test_x)
                 
+                gini_impurity_train = gini_impurity_mean(poly[0], torch.sigmoid(pred_train).round().cpu().data.numpy())
+                poly_test, _ = get_polytopes(model, test_x, penultimate=False)
+                gini_impurity_test = gini_impurity_mean(poly_test[0], torch.sigmoid(pred_test).round().cpu().data.numpy())
+                
+                rf_posteriors_grid = model(torch.FloatTensor(np.c_[xx.ravel(), yy.ravel()]).cuda())
+                class_1_posteriors = torch.sigmoid(rf_posteriors_grid).detach().cpu().numpy()
+                pred_proba = np.concatenate([1 - class_1_posteriors, class_1_posteriors], axis = 1)
+                
+                hellinger_loss = hellinger_explicit(pred_proba, true_posterior)
+
                 train_y = train_y.type_as(pred_train)
                 test_y  = test_y.type_as(pred_test)
                 train_loss = torch.nn.BCEWithLogitsLoss()(pred_train, train_y)
@@ -229,16 +258,26 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
 
             losses_list.append(losses)
             num_pars.append(n_par)
+            num_poly.append(n_poly)
 
             train_loss_list.append(train_loss.item())
             test_loss_list.append(test_loss.item())
             train_acc_list.append(1-train_acc)
-            test_acc_list.append(1-test_acc)                                                                                                                
-            fname = ("depth" if depth else "width") + (str(width) if width != 3 else "") + "_cov" + str(cov_scale) + "_" + str(i)
-        rep_full_list.append([losses_list, train_loss_list, test_loss_list, train_acc_list, test_acc_list])
-        
+            test_acc_list.append(1-test_acc)
+            hellinger_list.append(hellinger_loss)
+            gini_train.append(gini_impurity_train)
+            gini_test.append(gini_impurity_test) 
+
+            avg_stab = 0 #compute_avg_stability(model, hybrid_sets)
+            bias, var = 0,0 #compute_bias_variance(model, test_x, test_y, T=100)
+
+        rep_full_list.append([losses_list, train_loss_list, test_loss_list, train_acc_list, test_acc_list, briers, num_poly, gini_train, gini_test, avg_stab_list])
+        penultimate_vars_reps.append(penultimate_vars)
+
     result.num_pars = num_pars
-    [result.full_loss_list, result.test_loss_list, result.train_loss_list, result.test_err_list, result.train_err_list] = extract_losses(rep_full_list)
+    [result.full_loss_list, result.test_loss_list, result.train_loss_list, result.test_err_list, result.train_err_list, result.briers_list, result.poly_list, result.gini_train, result.gini_test, result.avg_stab, result.bias, result.var] = extract_losses(rep_full_list)
+     
+    result.penultimate_vars_reps = penultimate_vars_reps
 
     return result 
 
@@ -272,4 +311,158 @@ def compute_avg_stability(model, hybrid_set):
         stab_dif += ( ghost_loss.detach().cpu().numpy().item() - loss[-1] )
 
     return stab_dif / N
+
+# Gini impurity 
+def gini_impurity(P1=0, P2=0):
+    denom = P1 + P2
+    Ginx = 2 * (P1/denom) * (P2/denom)
+    return(Ginx)
+
+def gini_impurity_mean(polytope_memberships, predicts):
     
+    gini_mean_score = []
+    
+    for l in np.unique(polytope_memberships):
+        
+        cur_l_idx = predicts[polytope_memberships==l]
+        pos_count = np.sum(cur_l_idx)
+        neg_count = len(cur_l_idx) - pos_count
+        gini = gini_impurity(pos_count, neg_count)
+        gini_mean_score.append(gini) 
+
+    return np.array(gini_mean_score).mean()
+
+def gini_impurity_list(polytope_memberships, predicts):
+    
+    gini_score = np.zeros(polytope_memberships.shape)
+
+    for l in np.unique(polytope_memberships):        
+        idx = np.where(polytope_memberships==l)[0]
+        cur_l_idx = predicts[polytope_memberships==l]
+        pos_count = np.sum(cur_l_idx)
+        neg_count = len(cur_l_idx) - pos_count
+        gini = gini_impurity(pos_count, neg_count)
+        gini_score[idx] = (gini) 
+
+    return np.array(gini_score)#.mean()       
+
+# Hellinger distance
+def hellinger_explicit(p, q):
+    """Hellinger distance between two discrete distributions.
+       Same as original version but without list comprehension
+    """
+    return np.mean(np.sqrt(np.sum((np.sqrt(p) - np.sqrt(q)) ** 2, axis = 1)) / np.sqrt(2))
+
+def pdf(x):
+    mu01, mu02, mu11, mu12 = [[-1, -1], [1, 1], [-1, 1], [1, -1]]
+   
+    cov = 1 * np.eye(2)
+    inv_cov = np.linalg.inv(cov) 
+
+    p0 = (
+        np.exp(-(x - mu01)@inv_cov@(x-mu01).T) 
+        + np.exp(-(x - mu02)@inv_cov@(x-mu02).T)
+    )/(2*np.pi*np.sqrt(np.linalg.det(cov)))
+
+    p1 = (
+        np.exp(-(x - mu11)@inv_cov@(x-mu11).T) 
+        + np.exp(-(x - mu12)@inv_cov@(x-mu12).T)
+    )/(2*np.pi*np.sqrt(np.linalg.det(cov)))
+
+    return [p1/(p0+p1), p0/(p0+p1)]  
+
+# Polytope functions
+def get_polytopes(model, train_x, penultimate=False):
+    polytope_memberships = []
+    last_activations = train_x.cpu().numpy()
+    penultimate_act = None
+    layers = [module for module in model.modules() if type(module) == torch.nn.Linear]
+    
+    for layer_id, layer in enumerate(layers):
+        weights, bias = layer.weight.data.detach().cpu().numpy(), layer.bias.data.detach().cpu().numpy()
+        preactivation = np.matmul(last_activations, weights.T) + bias
+        if layer_id == len(layers) - 1:
+            binary_preactivation = (preactivation > 0.5).astype('int')
+        else:
+            binary_preactivation = (preactivation > 0).astype('int')
+        polytope_memberships.append(binary_preactivation)
+        last_activations = preactivation * binary_preactivation
+
+        if penultimate and layer_id == len(layers) - 1:
+            penultimate_act = last_activations
+    polytope_memberships = [np.tensordot(np.concatenate(polytope_memberships, axis = 1), 2 ** np.arange(0, np.shape(np.concatenate(polytope_memberships, axis = 1))[1]), axes = 1)]
+    
+    if penultimate:
+        return polytope_memberships, penultimate_act
+    return polytope_memberships, last_activations
+
+
+# Plot the result      
+def plot_results(results):
+    
+    sns.set()
+    fontsize=20
+    ticksize=20
+
+    bayes_err = 0.25
+
+    #Figure params
+    fontsize = 22
+    ticksize = 20
+    linewidth = 2
+    fig, axes = plt.subplots(figsize=(14,20), nrows=4, ncols=2, sharex='col', sharey='row')
+    # plt.figure(
+    plt.tick_params(labelsize=ticksize)
+    plt.tight_layout()
+
+    titles = ['DeepNet: Increasing Width', 'DeepNet: Increasing Depth', 'DeepNet: Increasing Width (5 layers)']
+
+
+    ## Average Stability, Bias and Variance
+    for i in range(len(results)):
+        result = results[i]
+        
+        # metric_list = [(result.train_err_list, result.test_err_list), (result.train_loss_list, result.test_loss_list), result.penultimate_vars_reps, result.poly_list, result.briers_list, (result.gini_train, result.gini_test), result.avg_stab, result.bias, result.var]
+        # metric_ylab = ["Generalization Error", "Cross-Entropy Loss", "Variance of last activation", "Activated regions", "Hellinger distance", "Gini impurity", "Average stability", "Average Bias", "Average Variance"]
+        metric_list = [(result.train_loss_list, result.test_loss_list), (result.gini_train, result.gini_test),  result.poly_list, result.avg_stab]
+        metric_ylab = ["Cross-Entropy Loss", "Gini impurity", "Activated regions", "Average stability"]
+
+        for j, metric in enumerate(metric_list):
+            ax = axes[j, i]
+            if isinstance(metric, tuple):
+                ax.plot(result.num_pars, np.median(metric[0], 0).clip(min=0), label = 'Train', linewidth=2)
+                ax.fill_between(result.num_pars, np.percentile(metric[0], 25, axis=0).clip(min=0), np.percentile(metric[0], 75, axis=0), alpha=0.2)
+                ax.plot(result.num_pars, np.median(metric[1], 0), label = 'Test', color='red', linewidth=2)
+                ax.fill_between(result.num_pars, np.percentile(metric[1], 25, axis=0).clip(min=0), np.percentile(metric[1], 75, axis=0), alpha=0.2)
+            else:
+                ax.plot(result.num_pars, np.median(metric, 0).clip(min=0), linewidth=2)
+                ax.fill_between(result.num_pars, np.percentile(metric, 25, axis=0).clip(min=0), np.percentile(metric, 75, axis=0), alpha=0.2)
+
+            ax.axvline(x=1000, color='gray', alpha=0.6)
+            if j == 0:
+                ax.set_title(titles[i], fontsize = fontsize+2)
+                # ax.axhline(y=bayes_err, color='gray', linestyle='--')
+                
+            if i==0:
+                ax.set_ylabel(metric_ylab[j], fontsize = fontsize)
+
+            ax.set_xscale("log")
+        #     ax = plt.gca()
+            ax.locator_params(nbins=6, axis='y')
+            # ax.locator_params(nbins=6, axis='x')
+            ax.tick_params(axis='both', which='major', labelsize=ticksize)
+
+    lines, labels = ax.get_legend_handles_labels()    
+    plt.legend( lines, labels, loc = 'best', bbox_to_anchor = (0.0,-0.009,1,1),
+                bbox_transform = plt.gcf().transFigure , fontsize=fontsize-5, frameon=False)
+        
+    plt.text(2.8, -0.0490, 'Total parameters', ha='center', fontsize=fontsize)
+    sns.despine();         
+    plt.savefig('results/DeepNet.pdf', bbox_inches='tight')
+
+
+## Example
+# result_d = run_experiment(depth=True, iterations=20, reps=1)
+# result_w = run_experiment(depth=False, iterations=70, reps=1)
+# results = [result_w, result_d]
+# plot_results(results)
