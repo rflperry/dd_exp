@@ -256,6 +256,8 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
     #             test_acc = (torch.argmax(pred_test,1) == torch.argmax(test_y,1)).sum().cpu().data.numpy().item() / test_y.size(0)
                 test_acc = (torch.sigmoid(pred_test).round() == test_y).sum().cpu().data.numpy().item() / test_y.size(0)
 
+            plot_decision_boundaries(model, n_node, n_poly, 1-test_acc, method='all', depth=depth)
+
             losses_list.append(losses)
             num_pars.append(n_par)
             num_poly.append(n_poly)
@@ -395,6 +397,100 @@ def get_polytopes(model, train_x, penultimate=False):
     if penultimate:
         return polytope_memberships, penultimate_act
     return polytope_memberships, last_activations
+
+def plot_decision_boundaries(model, num_node, num_poly, err, method='contour', depth=True):
+    # create grid to evaluate model
+    x_min, x_max = -5,5 
+    y_min, y_max = -5,5 
+    XX, YY = np.meshgrid(np.arange(x_min, x_max, (x_max - x_min) / 50),
+                         np.arange(y_min, y_max, (y_max - y_min) / 50))
+
+    XY = np.vstack([XX.ravel(), YY.ravel()]).T
+    
+    poly_m, activations = get_polytopes(model, torch.FloatTensor(XY))
+    
+    with torch.no_grad():
+        pred = model(torch.FloatTensor(XY).cuda())
+        pred = torch.sigmoid(pred).detach().cpu().numpy()
+
+    gini_list = gini_impurity_list(poly_m[0], np.round(pred))
+
+    Z = poly_m[0].reshape(XX.shape)
+    bins = np.arange(0,len(poly_m[0]))
+    act_bin = np.digitize(poly_m[0], bins)
+    
+    if method == 'all':
+        fig, ax = plt.subplots(1, 3, figsize=(21, 5))
+        for a in ax:
+            a.axes.xaxis.set_visible(False)
+            a.axes.yaxis.set_visible(False)
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+        ax.axes.xaxis.set_visible(False)
+        ax.axes.yaxis.set_visible(False)
+    if method == 'surface' or method=='all':
+        m = poly_m[0]
+        m = minmax_scale(m, feature_range=(0, 1), axis=0, copy=True)
+        my_col = cm.tab20b(m.reshape(XX.shape))
+
+        if method == 'surface':
+            fig = plt.figure(figsize=(7, 5))
+            ax = fig.add_subplot(111, projection='3d')
+        else:
+            ax = fig.add_subplot(132, projection='3d')
+        
+        ax.view_init(elev=45., azim=15)
+        ax.plot_surface(X=XX, Y=YY, Z=pred.reshape(XX.shape), facecolors=my_col, linewidth=0, antialiased=False, rstride=1, cstride=1)        
+        # Get rid of the panes
+        ax.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+
+        # Get rid of the spines
+        ax.w_xaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_yaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+        ax.w_zaxis.line.set_color((1.0, 1.0, 1.0, 0.0))
+
+        # Get rid of the ticks
+        ax.set_xticks([]) 
+        ax.set_yticks([]) 
+        ax.set_zticks([])
+        ax.set_title("Generalization error: %.4f" % err)
+
+    if method == 'colormesh' or method=='all':
+        if method == 'all':
+            ax = fig.add_subplot(131)
+        plt.pcolormesh(XX, YY, Z, cmap="PRGn")
+        ax.set_xticks([]) 
+        ax.set_yticks([]) 
+
+        ax.set_title("Nodes: " + str(num_node) + "; # of activated regions: " + str(num_poly))
+
+    # if method == 'contour' or method=='all':
+    #     if method == 'all':
+    #         ax = fig.add_subplot(142)
+        
+    #     plt.contourf(XX, YY, Z, cmap="tab20b",  vmin = np.min(Z), vmax = np.max(Z))
+    #     ax.set_title("Nodes: " + str(num_node) + "; # of activated regions: " + str(num_poly))
+    #     ax.set_xticks([]) 
+    #     ax.set_yticks([]) 
+    
+    if method == 'gini' or method=='all':
+        if method == 'all':
+            ax = fig.add_subplot(133)
+        # gini_Z = minmax_scale(gini_list, feature_range=(0, 1), axis=0, copy=True)
+        gini_Z = gini_list.reshape(XX.shape)
+        plt.pcolormesh(XX, YY, gini_Z, cmap="Reds", vmin = 0, vmax = 0.5)
+        cbar = plt.colorbar(ticks=np.linspace(0, 0.5, 2))
+        cbar.ax.set_title('gini index', fontsize=12, pad=12)
+        cbar.set_ticklabels(['0','0.5'])
+        ax.set_title("Mean: %.4f" % np.mean(gini_list) )
+        ax.set_xticks([]) 
+        ax.set_yticks([]) 
+
+    exp = "depth" if depth else "width"
+    plt.savefig('polytopes/xor_%s_%s_%04d.png'%(exp,method,num_node))
+    # plt.show()
 
 
 # Plot the result      
