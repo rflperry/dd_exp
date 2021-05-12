@@ -99,9 +99,10 @@ def train_model(model, train_x, train_y, multi_label=False, verbose=False):
     
     return losses
                 
-def get_model(hidden_size=20, n_hidden=5, in_dim=2, out_dim=1, penultimate=False, use_cuda=True, bn=False):
+def get_model(hidden_size=20, n_hidden=5, in_dim=2, out_dim=1, penultimate=False, use_cuda=False, bn=False):
     in_dim = in_dim
     out_dim = out_dim #1
+    use_cuda = torch.cuda.is_available()
     model = Net(in_dim, out_dim, n_hidden=n_hidden, hidden_size=hidden_size,
                 activation=torch.nn.ReLU(), bias=True, penultimate=penultimate, bn=bn)
     
@@ -172,7 +173,7 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
     rep_full_list = []
     imgs = []
 #     train_x, train_y, test_x, test_y = get_dataset(cov_scale=cov_scale)
-    train_x, train_y, test_x, test_y, hybrid_sets = get_dataset(N=1000, cov_scale=cov_scale, include_hybrid=True)
+    train_x, train_y, test_x, test_y = get_dataset(N=1000, cov_scale=cov_scale, include_hybrid=False)
     depth = depth
     penultimate_vars_reps = []
     for rep in range(reps):#25
@@ -191,7 +192,7 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
         num_poly = []
         hellinger_list = []
         gini_train, gini_test = [], []
-
+        briers = []
         
         train_loss_list = []
         test_loss_list = []
@@ -205,6 +206,8 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
         penultimate_vars = []
 
         avg_stab_list = []
+
+        polytopes_per_epsilon = []
 
         for i in range(1, iterations):
             print('now running', i)
@@ -237,11 +240,11 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
             with torch.no_grad():
                 pred_train, pred_test = model(train_x), model(test_x)
                 
-                gini_impurity_train = gini_impurity_mean(poly[0], torch.sigmoid(pred_train).round().cpu().data.numpy())
+                gini_impurity_train = gini_impurity_mean(poly[0], torch.sigmoid(pred_train).cpu().data.numpy())
                 poly_test, _ = get_polytopes(model, test_x, penultimate=False)
-                gini_impurity_test = gini_impurity_mean(poly_test[0], torch.sigmoid(pred_test).round().cpu().data.numpy())
+                gini_impurity_test = gini_impurity_mean(poly_test[0], torch.sigmoid(pred_test).cpu().data.numpy())
                 
-                rf_posteriors_grid = model(torch.FloatTensor(np.c_[xx.ravel(), yy.ravel()]).cuda())
+                rf_posteriors_grid = model(torch.FloatTensor(np.c_[xx.ravel(), yy.ravel()]))
                 class_1_posteriors = torch.sigmoid(rf_posteriors_grid).detach().cpu().numpy()
                 pred_proba = np.concatenate([1 - class_1_posteriors, class_1_posteriors], axis = 1)
                 
@@ -256,7 +259,17 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
     #             test_acc = (torch.argmax(pred_test,1) == torch.argmax(test_y,1)).sum().cpu().data.numpy().item() / test_y.size(0)
                 test_acc = (torch.sigmoid(pred_test).round() == test_y).sum().cpu().data.numpy().item() / test_y.size(0)
 
-            plot_decision_boundaries(model, n_node, n_poly, 1-test_acc, method='all', depth=depth)
+                for epsilon in [0.0001, 0.001, 0.01, 0.1, 1]:
+                    reps_list = []
+                    for _ in range(5):
+                        model_pert = copy.deepcopy(model)
+                        for parameter in model_pert.parameters():
+                            parameter += torch.normal(0, epsilon, parameter.shape)
+                        pert_poly = get_polytopes(model_pert, train_x, penultimate=False)
+                        reps_list.append(len(np.unique(pert_poly[0])))
+                    polytopes_per_epsilon.append(reps_list)
+
+            # plot_decision_boundaries(model, n_node, n_poly, 1-test_acc, method='all', depth=depth)
 
             losses_list.append(losses)
             num_pars.append(n_par)
@@ -273,11 +286,19 @@ def run_experiment(depth, iterations, reps=100, width=3, cov_scale=1):
             avg_stab = 0 #compute_avg_stability(model, hybrid_sets)
             bias, var = 0,0 #compute_bias_variance(model, test_x, test_y, T=100)
 
-        rep_full_list.append([losses_list, train_loss_list, test_loss_list, train_acc_list, test_acc_list, briers, num_poly, gini_train, gini_test, avg_stab_list])
+        rep_full_list.append([losses_list, train_loss_list, test_loss_list, train_acc_list, test_acc_list, briers, num_poly, gini_train, gini_test, avg_stab_list, polytopes_per_epsilon])
+        if depth:
+            tag = 'depth'
+        else:
+            tag = 'width'
+        np.save(
+            f"results/xor_nn_dd_" + tag + "_" + str(rep) + ".npy",
+            rep_full_list[-1] + [penultimate_vars] + [num_pars]
+        )
         penultimate_vars_reps.append(penultimate_vars)
 
     result.num_pars = num_pars
-    [result.full_loss_list, result.test_loss_list, result.train_loss_list, result.test_err_list, result.train_err_list, result.briers_list, result.poly_list, result.gini_train, result.gini_test, result.avg_stab, result.bias, result.var] = extract_losses(rep_full_list)
+    [result.full_loss_list, result.test_loss_list, result.train_loss_list, result.test_err_list, result.train_err_list] = extract_losses(rep_full_list)
      
     result.penultimate_vars_reps = penultimate_vars_reps
 
@@ -410,10 +431,10 @@ def plot_decision_boundaries(model, num_node, num_poly, err, method='contour', d
     poly_m, activations = get_polytopes(model, torch.FloatTensor(XY))
     
     with torch.no_grad():
-        pred = model(torch.FloatTensor(XY).cuda())
+        pred = model(torch.FloatTensor(XY))
         pred = torch.sigmoid(pred).detach().cpu().numpy()
 
-    gini_list = gini_impurity_list(poly_m[0], np.round(pred))
+    gini_list = gini_impurity_list(poly_m[0], pred)
 
     Z = poly_m[0].reshape(XX.shape)
     bins = np.arange(0,len(poly_m[0]))
@@ -558,7 +579,7 @@ def plot_results(results):
 
 
 ## Example
-# result_d = run_experiment(depth=True, iterations=20, reps=1)
-# result_w = run_experiment(depth=False, iterations=70, reps=1)
+result_d = run_experiment(depth=True, iterations=20, reps=10)
+result_w = run_experiment(depth=False, iterations=70, reps=10)
 # results = [result_w, result_d]
 # plot_results(results)
